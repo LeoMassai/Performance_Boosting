@@ -192,7 +192,8 @@ class PBController(nn.Module):
         self.state = PBState(x_tm1=x_init, u_tm1=u_init, w0=w0, has_prev=False)
         self.operator.reset()
 
-    def _compute_w_t(self, x_t: torch.Tensor, t: Optional[int] = None) -> torch.Tensor:
+    def _compute_w_t(self, x_t: torch.Tensor, t
+    : Optional[int] = None) -> torch.Tensor:
         assert self.state is not None
         if not self.state.has_prev:
             return self.state.w0

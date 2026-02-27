@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--test_batch", type=int, default=2048)
     parser.add_argument("--horizon", type=int, default=80)
-    parser.add_argument("--epochs", type=int, default=160)
+    parser.add_argument("--epochs", type=int, default=12000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--eval_every", type=int, default=5)
@@ -59,12 +59,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional external actuator clamp. If omitted, no post-controller clamping is used.",
     )
 
-    parser.add_argument("--use_safety_shield", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--safety_shield_activation", type=float, default=0.22)
-    parser.add_argument("--safety_shield_gain", type=float, default=8.0)
-    parser.add_argument("--safety_shield_damping", type=float, default=3.0)
-    parser.add_argument("--safety_shield_max_add", type=float, default=18.0)
-
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--mb_bound_mode", type=str, default="softsign", choices=["tanh", "softsign", "clamp"])
     parser.add_argument("--mb_bound_value", type=float, default=78.0)
@@ -72,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--mb_no_z_residual", action="store_true")
     parser.add_argument("--mb_z_residual_gain", type=float, default=10.0)
-    parser.add_argument("--mp_param", type=str, default="tv")
+    parser.add_argument("--mp_param", type=str, default="lru")
     parser.add_argument("--mp_layers", type=int, default=4)
     parser.add_argument("--mp_mode", type=str, default="loop", choices=["loop", "scan"])
     parser.add_argument("--mp_d_model", type=int, default=16)
@@ -85,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mp_gamma", type=float, default=10.0)
     parser.add_argument("--mp_detach_state", action="store_true")
 
-    parser.add_argument("--loss_mode", type=str, default="direct", choices=["natural", "shaped", "direct"])
+    parser.add_argument("--loss_mode", type=str, default="shaped", choices=["natural", "shaped", "direct"])
     parser.add_argument("--collision_weight", type=float, default=24.0)
     parser.add_argument("--control_weight", type=float, default=0.02)
     parser.add_argument("--smooth_weight", type=float, default=0.05)
@@ -183,59 +177,14 @@ def make_context_fn(scenario):
 
 
 def make_u_post_fn(args, scenario=None):
+    del scenario
     use_clamp = args.u_max is not None and args.u_max > 0
-    use_shield = bool(args.use_safety_shield)
-
-    if not use_clamp and not use_shield:
+    if not use_clamp:
         return None
 
-    if use_shield and scenario is None:
-        raise ValueError("scenario must be provided when use_safety_shield is enabled")
-
-    centers = scenario.centers if scenario is not None else None
-    radii = scenario.radii if scenario is not None else None
-
     def post_fn(x, u, t=None):
-        u_out = u
-
-        if use_shield:
-            x_bt = x
-            pos = x_bt[..., :2]
-            vel = x_bt[..., 2:]
-
-            centers_bt = centers.to(pos.device).unsqueeze(1)  # (B,1,K,2)
-            radii_bt = radii.to(pos.device).unsqueeze(1)      # (B,1,K)
-
-            rel = pos.unsqueeze(2) - centers_bt               # (B,1,K,2)
-            dist = torch.norm(rel, dim=-1).clamp_min(1e-6)   # (B,1,K)
-            edge = dist - radii_bt
-
-            act = max(float(args.safety_shield_activation), 1e-6)
-            w = torch.relu(act - edge) / act                  # (B,1,K)
-            direction = rel / dist.unsqueeze(-1)              # (B,1,K,2)
-
-            repulse = (w ** 2).unsqueeze(-1) * direction
-            repulse = repulse.sum(dim=2)                      # (B,1,2)
-
-            vdot = (vel.unsqueeze(2) * direction).sum(dim=-1) # (B,1,K)
-            inward = torch.relu(-vdot)
-            damping = (w * inward).unsqueeze(-1) * direction
-            damping = damping.sum(dim=2)                      # (B,1,2)
-
-            delta_u = float(args.safety_shield_gain) * repulse + float(args.safety_shield_damping) * damping
-
-            max_add = float(args.safety_shield_max_add)
-            if max_add > 0:
-                du_norm = torch.norm(delta_u, dim=-1, keepdim=True).clamp_min(1e-6)
-                scale = torch.clamp(max_add / du_norm, max=1.0)
-                delta_u = delta_u * scale
-
-            u_out = u_out + delta_u
-
-        if use_clamp:
-            u_out = torch.clamp(u_out, -args.u_max, args.u_max)
-
-        return u_out
+        del x, t
+        return torch.clamp(u, -args.u_max, args.u_max)
 
     return post_fn
 
@@ -1241,14 +1190,6 @@ def main() -> None:
         f"[info] M_p spectrum params: rho={args.mp_rho:.4f}, "
         f"rmin={args.mp_rmin:.4f}, rmax={args.mp_rmax:.4f}, gamma={args.mp_gamma:.2f}"
     )
-    if args.use_safety_shield:
-        print(
-            f"[info] Safety shield enabled: act={args.safety_shield_activation:.2f}, "
-            f"gain={args.safety_shield_gain:.2f}, damp={args.safety_shield_damping:.2f}, "
-            f"max_add={args.safety_shield_max_add:.2f}"
-        )
-    else:
-        print("[info] Safety shield disabled.")
 
     optimizer = torch.optim.Adam(controller.parameters(), lr=args.lr)
 

@@ -53,12 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_box", type=float, default=2.0)
     parser.add_argument("--u_max", type=float, default=None)
 
-    parser.add_argument("--use_safety_shield", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--safety_shield_activation", type=float, default=0.22)
-    parser.add_argument("--safety_shield_gain", type=float, default=7.5)
-    parser.add_argument("--safety_shield_damping", type=float, default=2.8)
-    parser.add_argument("--safety_shield_max_add", type=float, default=16.0)
-
     parser.add_argument("--num_obstacles", type=int, default=1, choices=[1, 3])
     parser.add_argument("--single_obstacle_x", type=float, default=1.0)
     parser.add_argument("--single_obstacle_y", type=float, default=0.0)
@@ -78,8 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--challenge_angle_bins", type=int, default=20)
 
     parser.add_argument("--feat_dim", type=int, default=24)
-    parser.add_argument("--mp_param", type=str, default="tv")
-    parser.add_argument("--mp_layers", type=int, default=4)
+    parser.add_argument("--mp_param", type=str, default="lru")
+    parser.add_argument("--mp_layers", type=int, default=2)
     parser.add_argument("--mp_mode", type=str, default="loop", choices=["loop", "scan"])
     parser.add_argument("--mp_d_model", type=int, default=16)
     parser.add_argument("--mp_d_state", type=int, default=32)
@@ -102,10 +96,22 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--distance_weight", type=float, default=14.0)
     parser.add_argument("--terminal_distance_weight", type=float, default=30.0)
+    parser.add_argument("--target_time_weight_end", type=float, default=2.0)
+    parser.add_argument("--target_arrival_weight", type=float, default=3.0)
+    parser.add_argument("--target_arrival_radius", type=float, default=0.12)
+    parser.add_argument("--target_arrival_temp", type=float, default=0.03)
+    parser.add_argument("--target_progress_weight", type=float, default=1.0)
+    parser.add_argument("--target_progress_margin", type=float, default=0.0)
     parser.add_argument("--barrier_weight", type=float, default=18.0)
+    parser.add_argument("--barrier_weight_start", type=float, default=4.0)
+    parser.add_argument("--barrier_ramp_epochs", type=int, default=40)
     parser.add_argument("--barrier_margin", type=float, default=0.10)
     parser.add_argument("--barrier_eps", type=float, default=2e-3)
-    parser.add_argument("--barrier_cap", type=float, default=120.0)
+    parser.add_argument("--barrier_cap", type=float, default=600.0)
+    parser.add_argument("--barrier_power", type=float, default=2.0)
+    parser.add_argument("--barrier_softmin_temp", type=float, default=0.08)
+    parser.add_argument("--barrier_inside_gain", type=float, default=10.0)
+    parser.add_argument("--barrier_inside_alpha", type=float, default=8.0)
     parser.add_argument("--robot_radius", type=float, default=0.02)
 
     parser.add_argument("--use_decaying_noise", action="store_true")
@@ -164,53 +170,14 @@ def make_context_fn(scenario):
 
 
 def make_u_post_fn(args, scenario=None):
+    del scenario
     use_clamp = args.u_max is not None and args.u_max > 0
-    use_shield = bool(args.use_safety_shield)
-
-    if not use_clamp and not use_shield:
+    if not use_clamp:
         return None
-    if use_shield and scenario is None:
-        raise ValueError("scenario is required when use_safety_shield is enabled")
-
-    centers = scenario.centers if scenario is not None else None
-    radii = scenario.radii if scenario is not None else None
 
     def post_fn(x, u, t=None):
-        u_out = u
-
-        if use_shield:
-            pos = x[..., :2]
-            vel = x[..., 2:]
-
-            centers_bt = centers.to(pos.device).unsqueeze(1)
-            radii_bt = radii.to(pos.device).unsqueeze(1)
-            rel = pos.unsqueeze(2) - centers_bt
-            dist = torch.norm(rel, dim=-1).clamp_min(1e-6)
-            edge = dist - radii_bt
-
-            act = max(float(args.safety_shield_activation), 1e-6)
-            w = torch.relu(act - edge) / act
-            direction = rel / dist.unsqueeze(-1)
-
-            repulse = ((w**2).unsqueeze(-1) * direction).sum(dim=2)
-            vdot = (vel.unsqueeze(2) * direction).sum(dim=-1)
-            inward = torch.relu(-vdot)
-            damping = (w * inward).unsqueeze(-1) * direction
-            damping = damping.sum(dim=2)
-
-            delta_u = float(args.safety_shield_gain) * repulse + float(args.safety_shield_damping) * damping
-
-            max_add = float(args.safety_shield_max_add)
-            if max_add > 0:
-                du_norm = torch.norm(delta_u, dim=-1, keepdim=True).clamp_min(1e-6)
-                scale = torch.clamp(max_add / du_norm, max=1.0)
-                delta_u = delta_u * scale
-
-            u_out = u_out + delta_u
-
-        if use_clamp:
-            u_out = torch.clamp(u_out, -args.u_max, args.u_max)
-        return u_out
+        del x, t
+        return torch.clamp(u, -args.u_max, args.u_max)
 
     return post_fn
 
@@ -317,23 +284,82 @@ def build_fixed_obstacle_dataset(
     return scenario, ch_info
 
 
-def barrier_origin_loss_per_sample(x_seq: torch.Tensor, u_seq: torch.Tensor, scenario, args) -> LossBreakdown:
+def _smooth_min_obstacle_distance(dist_edge_all: torch.Tensor, temp: float) -> torch.Tensor:
+    """Differentiable min over obstacles, shape (B,T,K) -> (B,T)."""
+    if dist_edge_all.ndim != 3:
+        raise ValueError(f"Expected dist_edge_all shape (B,T,K), got {tuple(dist_edge_all.shape)}")
+    if dist_edge_all.shape[-1] == 1:
+        return dist_edge_all[..., 0]
+    t = max(float(temp), 1e-6)
+    return -t * torch.logsumexp(-dist_edge_all / t, dim=-1)
+
+
+def barrier_origin_loss_per_sample(
+    x_seq: torch.Tensor,
+    u_seq: torch.Tensor,
+    scenario,
+    args,
+    barrier_weight_override: float | None = None,
+) -> LossBreakdown:
     pos = x_seq[:, :, :2]
     goal = scenario.goal.to(pos.device).unsqueeze(1)
     goal_dist = torch.norm(goal - pos, dim=-1)
     del u_seq
 
+    # Target term: shaped only from distance-to-goal signal.
+    d0 = torch.norm(
+        scenario.start.to(pos.device) - scenario.goal.to(pos.device),
+        dim=-1,
+    ).clamp_min(1e-3).unsqueeze(1)
+    d_norm = goal_dist / d0
+
+    t_steps = goal_dist.shape[1]
+    if t_steps > 1:
+        tw = torch.linspace(
+            1.0,
+            float(args.target_time_weight_end),
+            t_steps,
+            device=goal_dist.device,
+            dtype=goal_dist.dtype,
+        ).view(1, t_steps)
+        d_weighted = (d_norm * tw).mean(dim=1)
+        progress = torch.nn.functional.softplus(
+            d_norm[:, 1:] - d_norm[:, :-1] + float(args.target_progress_margin)
+        ).mean(dim=1)
+    else:
+        d_weighted = d_norm[:, 0]
+        progress = torch.zeros_like(d_weighted)
+
+    arrival = torch.sigmoid(
+        (goal_dist - float(args.target_arrival_radius)) / max(float(args.target_arrival_temp), 1e-6)
+    ).mean(dim=1)
+
     distance = (
-        args.distance_weight * goal_dist.mean(dim=1)
-        + args.terminal_distance_weight * goal_dist[:, -1]
+        args.distance_weight * d_weighted
+        + args.terminal_distance_weight * d_norm[:, -1]
+        + args.target_arrival_weight * arrival
+        + args.target_progress_weight * progress
     )
 
     dist_edge_all = obstacle_edge_distances(x_seq, scenario, robot_radius=args.robot_radius)
-    dist_edge = dist_edge_all.min(dim=-1).values
-    safe = torch.clamp(dist_edge + float(args.barrier_margin), min=float(args.barrier_eps))
-    barrier = torch.clamp(1.0 / safe, max=float(args.barrier_cap)).mean(dim=1)
+    dist_edge = _smooth_min_obstacle_distance(dist_edge_all, temp=float(args.barrier_softmin_temp))
 
-    total = distance + args.barrier_weight * barrier
+    signed = dist_edge + float(args.barrier_margin)
+    eps = float(args.barrier_eps)
+    p = max(float(args.barrier_power), 1e-6)
+    safe = torch.clamp(signed, min=eps)
+
+    # Outside term: inverse-power barrier (steeper than 1/x when power>1).
+    outside = 1.0 / (safe**p)
+    # Inside term: exponential growth when inside margin, then globally capped.
+    inside_depth = torch.relu(-signed)
+    inside = float(args.barrier_inside_gain) * (torch.exp(float(args.barrier_inside_alpha) * inside_depth) - 1.0)
+
+    raw_barrier = outside + inside
+    barrier = torch.clamp(raw_barrier, max=float(args.barrier_cap)).mean(dim=1)
+
+    bw = float(args.barrier_weight) if barrier_weight_override is None else float(barrier_weight_override)
+    total = distance + bw * barrier
     return LossBreakdown(
         total=total,
         distance=distance,
@@ -341,12 +367,48 @@ def barrier_origin_loss_per_sample(x_seq: torch.Tensor, u_seq: torch.Tensor, sce
     )
 
 
-def loss_per_sample(x_seq: torch.Tensor, u_seq: torch.Tensor, scenario, args) -> torch.Tensor:
-    return barrier_origin_loss_per_sample(x_seq, u_seq, scenario, args).total
+def loss_per_sample(
+    x_seq: torch.Tensor,
+    u_seq: torch.Tensor,
+    scenario,
+    args,
+    barrier_weight_override: float | None = None,
+) -> torch.Tensor:
+    return barrier_origin_loss_per_sample(
+        x_seq,
+        u_seq,
+        scenario,
+        args,
+        barrier_weight_override=barrier_weight_override,
+    ).total
 
 
-def loss_fn(x_seq: torch.Tensor, u_seq: torch.Tensor, scenario, args) -> torch.Tensor:
-    return loss_per_sample(x_seq, u_seq, scenario, args).mean()
+def loss_fn(
+    x_seq: torch.Tensor,
+    u_seq: torch.Tensor,
+    scenario,
+    args,
+    barrier_weight_override: float | None = None,
+) -> torch.Tensor:
+    return loss_per_sample(
+        x_seq,
+        u_seq,
+        scenario,
+        args,
+        barrier_weight_override=barrier_weight_override,
+    ).mean()
+
+
+def barrier_weight_at_epoch(args, epoch: int) -> float:
+    target = float(args.barrier_weight)
+    start = float(args.barrier_weight_start)
+    ramp = int(args.barrier_ramp_epochs)
+    if ramp <= 0:
+        return target
+
+    alpha = float(epoch - 1) / float(max(ramp - 1, 1))
+    alpha = max(0.0, min(1.0, alpha))
+    return start + alpha * (target - start)
 
 
 def evaluate(controller, plant_true, scenario, horizon, args, process_noise_seq=None):
@@ -355,7 +417,7 @@ def evaluate(controller, plant_true, scenario, horizon, args, process_noise_seq=
         x0 = make_rollout_inputs(scenario)
         ctx_fn = make_context_fn(scenario)
         u_post = make_u_post_fn(args, scenario)
-        x_seq, u_seq, w_seq = rollout_bptt(
+        x_seq, u_seq, _ = rollout_bptt(
             controller=controller,
             plant_true=plant_true,
             x0=x0,
@@ -371,10 +433,12 @@ def evaluate(controller, plant_true, scenario, horizon, args, process_noise_seq=
         terminal = torch.norm(x_seq[:, -1, :2], dim=-1)
         min_dist = min_dist_to_edge(x_seq, scenario)
         collision_rate = (min_dist.min(dim=1).values < 0.0).float().mean()
-        del w_seq
 
     return {
         "loss": float(loss.item()),
+        "target_term": float(per.distance.mean().item()),
+        "distance_term": float(per.distance.mean().item()),
+        "barrier_term": float(per.barrier.mean().item()),
         "terminal_dist": float(terminal.mean().item()),
         "collision_rate": float(collision_rate.item()),
     }, x_seq, u_seq
@@ -966,7 +1030,13 @@ def main() -> None:
     print(
         "[loss] "
         f"distance={args.distance_weight}, terminal_distance={args.terminal_distance_weight}, "
-        f"barrier={args.barrier_weight}"
+        f"time_end={args.target_time_weight_end}, arr_w={args.target_arrival_weight}, "
+        f"arr_r={args.target_arrival_radius}, arr_tau={args.target_arrival_temp}, "
+        f"prog_w={args.target_progress_weight}, prog_m={args.target_progress_margin}, "
+        f"barrier={args.barrier_weight}, barrier_start={args.barrier_weight_start}, "
+        f"ramp_epochs={args.barrier_ramp_epochs}, power={args.barrier_power}, "
+        f"inside_gain={args.barrier_inside_gain}, inside_alpha={args.barrier_inside_alpha}, "
+        f"softmin_temp={args.barrier_softmin_temp}"
     )
 
     optimizer = torch.optim.Adam(controller.parameters(), lr=args.lr)
@@ -1041,7 +1111,14 @@ def main() -> None:
             process_noise_seq=train_noise,
         )
 
-        loss = loss_fn(x_seq, u_seq, train_scenario, args)
+        bw_epoch = barrier_weight_at_epoch(args, epoch)
+        loss = loss_fn(
+            x_seq,
+            u_seq,
+            train_scenario,
+            args,
+            barrier_weight_override=bw_epoch,
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -1064,6 +1141,9 @@ def main() -> None:
                 {
                     "epoch": epoch,
                     "loss": metrics["loss"],
+                    "target_term": metrics["target_term"],
+                    "barrier_term": metrics["barrier_term"],
+                    "collision_rate": metrics["collision_rate"],
                 }
             )
 
@@ -1097,8 +1177,11 @@ def main() -> None:
             print(
                 f"epoch {epoch:03d} | train {loss.item():.6f} | "
                 f"test {metrics['loss']:.6f} | "
+                f"test_target {metrics['target_term']:.4f} | "
+                f"test_bar {metrics['barrier_term']:.4f} | "
                 f"terminal {metrics['terminal_dist']:.4f} | "
                 f"collision {metrics['collision_rate']:.3f} | "
+                f"bw {bw_epoch:.2f} | "
                 f"chall {train_ch_info_epoch['after_fraction']:.2f}"
             )
 
