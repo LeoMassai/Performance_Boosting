@@ -164,8 +164,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "vs. full factorized M_b⊠M_p with context (+ lifting if enabled). "
                              "Skips nominal-only and matched-param M_p-only+context variants.")
     parser.add_argument("--no_simple_comparison", dest="simple_comparison", action="store_false")
-    parser.set_defaults(simple_comparison=True)
-    parser.add_argument("--context_mode", type=str, default="full",
+    parser.set_defaults(simple_comparison=False)
+    parser.add_argument("--context_mode", type=str, default="minimal",
                         choices=["full", "minimal"],
                         help="Context feature set fed to the PB operator. "
                              "'full' uses all 11 features; 'minimal' uses only "
