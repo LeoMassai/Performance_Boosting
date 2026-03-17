@@ -80,7 +80,6 @@ Key outputs per run:
 | `wall_style_summary.png` | Trajectory overview + success rates |
 | `trajectory_samples.png` | Per-sample top-down trajectories |
 | `adversarial_switching.png` | Performance under late adversarial gate switch |
-| `sample_trajectory.pdf` | Publication-quality trajectory figure |
 | `rollout_animation_*.gif` | Animated rollouts |
 | `*_controller.pt` | Saved controller weights |
 | `metrics.json` | Numerical evaluation metrics |
