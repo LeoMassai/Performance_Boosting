@@ -1,54 +1,85 @@
-# Contextual PB Gate SSM
+# Moving Gate Experiment
 
-This folder contains an isolated version of the contextual gate experiment.
+A planar navigation task that demonstrates the advantage of **contextual
+Performance Boosting** over a disturbance-only baseline.
 
-What is different from the older self-contained skeleton:
+![Sample rollout](runs/controlled_xy_20260317_150748/rollout_animation_04_idx1.gif)
 
-- It uses the shared `PBController` stack instead of a tiny stand-alone MLP.
-- `M_p` is `MpDeepSSM`, so disturbance processing is handled by the project SSM.
-- `M_p(w)` is augmented with a context signal passed through `LpContextLifter`, so the SSM sees a filtered `l_p`-compatible context sequence.
-- The wall is placed at the origin and trajectories start to the left, so the final goal geometry is centered at `x=0`.
-- The gate schedule is frozen before the wall, so the final switch is not too late to matter.
-- The contextual signal is richer than a single gate scalar, but it remains causal.
+---
 
-Run the scalar lateral experiment from the repository root with:
+## Task description
+
+A pre-stabilised double integrator must reach the origin `(0, 0)` while
+passing through a **moving gate** embedded in a wall at `x = x_w`.
+The gate opening has half-width `h` and its centre `g_t` switches
+randomly between two positions at discrete times, then freezes before
+the crossing window.
+
+The robot must decide **in real time** when to commit to a crossing
+direction — too early and it may be caught by a late switch; too late
+and it overshoots the goal.  Neither the nominal pre-stabiliser nor a
+disturbance-only PB operator has access to `g_t`, so they cannot adapt.
+The context-enriched PB operator receives a compact, causal summary of
+the gate and learns to time its corrective action accordingly.
+
+---
+
+## Setup
+
+| Quantity | Description |
+|---|---|
+| State | 2D position + velocity `(x, y, vx, vy)` |
+| Control | 2D force input `(ux, uy)` |
+| Gate | Centre `g_t` switches stochastically, freezes `gate_settle_steps` before the wall |
+| Context `z_t` | Gate error `(y_t − g_t)`, proximity to wall `α_t`, gate switch age `σ_t` |
+| Horizon | 160 steps, `dt = 0.05 s` |
+
+The three context features are **directly observable** without knowledge
+of the freeze schedule: a rising switch age `σ_t` near the wall
+(`α_t ≈ 1`) indicates that the gate has been stable long enough to
+commit.
+
+---
+
+## Variants compared
+
+| Variant | Description |
+|---|---|
+| **Nominal** | Pre-stabiliser only, no PB correction |
+| **PB: no context** | PB+SSM operator seeing only disturbance `w_t` |
+| **PB: factorized M_b × M_p** | PB+SSM with context-aware factorized operator |
+
+---
+
+## Running the experiment
+
+From the repository root:
 
 ```bash
-python experiments/contextual_pb_gate_ssm/run_experiment.py --no_show_plots
+python experiments/contextual_pb_gate_ssm/Moving_gate_exp.py --no_show_plots
 ```
 
-Run the controlled-`x/y` variant, where the learned control also affects the forward motion and the terminal goal is the origin `(0, 0)`, with:
+To reproduce plots from a completed run without retraining:
 
 ```bash
-python experiments/contextual_pb_gate_ssm/run_experiment_controlled_xy.py --no_show_plots
+python experiments/contextual_pb_gate_ssm/Moving_gate_exp.py \
+    --plot_only controlled_xy_<timestamp>
 ```
 
-By default, the disturbance-only PB baseline is trained for fewer epochs than the context-aware model. Override it with `--disturbance_only_epochs`.
+Results are written to:
 
-The controlled-`x/y` script now defaults to a less predictable gate process: stochastic switch timing (`--gate_process hazard`, `--gate_switch_prob`) and per-trajectory settle-time jitter (`--gate_settle_jitter`). Use `--gate_process alternating` to recover the older deterministic alternating schedule.
-
-It also includes explicit post-wall recovery penalties so trajectories are pushed back toward the origin after clearing the wall instead of taking large detours (`--post_wall_goal_weight`, `--post_wall_lateral_weight`, `--origin_overshoot_weight`).
-
-To plot-check that the overall factorized operator `M(w,z)` decays to zero for decaying source signals, run:
-
-```bash
-python experiments/contextual_pb_gate_ssm/plot_mp_input_decay_test.py --no_show_plots
 ```
-
-Outputs are written under:
-
-```text
 experiments/contextual_pb_gate_ssm/runs/<run_id>/
 ```
 
-The controlled-`x/y` script writes additional figures:
+Key outputs per run:
 
-- `wall_style_summary.png`
-- `loss_curves.png`
-- `control_magnitude_over_time.png`
-- `trajectory_samples.png`
-
-The decay diagnostic writes:
-
-- `operator_decay_test.png`
-- `metrics.json`
+| File | Description |
+|---|---|
+| `wall_style_summary.png` | Trajectory overview + success rates |
+| `trajectory_samples.png` | Per-sample top-down trajectories |
+| `adversarial_switching.png` | Performance under late adversarial gate switch |
+| `sample_trajectory.pdf` | Publication-quality trajectory figure |
+| `rollout_animation_*.gif` | Animated rollouts |
+| `*_controller.pt` | Saved controller weights |
+| `metrics.json` | Numerical evaluation metrics |

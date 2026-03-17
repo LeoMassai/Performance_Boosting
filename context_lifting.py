@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from pb_controller import as_bt
+from pb_core import as_bt
 
 
 class LpContextLifter(nn.Module):

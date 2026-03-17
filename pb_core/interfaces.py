@@ -15,15 +15,6 @@ class BatchData:
     payload: Any
 
 
-class NominalPlant(Protocol):
-    """Plant model used inside PB for disturbance reconstruction."""
-
-    def nominal_dynamics(
-        self, x: torch.Tensor, u: torch.Tensor, t: int | None = None
-    ) -> torch.Tensor:
-        ...
-
-
 class TruePlant(Protocol):
     """True plant used for rollout."""
 

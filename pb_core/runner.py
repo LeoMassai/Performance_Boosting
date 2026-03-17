@@ -9,7 +9,7 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from pb_controller import PBController, as_bt
+from .controller import PBController, as_bt
 
 from .interfaces import BatchData, ContextBuilder, DatasetProvider, LossFn, MetricsFn, NoiseModel
 from .noise import ZeroNoise

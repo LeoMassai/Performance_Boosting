@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from pb_controller import PBController, as_bt
+from .controller import PBController, as_bt
 
 
 def validate_component_compatibility(

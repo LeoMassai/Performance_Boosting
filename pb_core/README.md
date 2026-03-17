@@ -77,11 +77,6 @@ result = runner.train(
 Existing scripts can continue to use `PBController` directly.
 `pb_core` is additive: it does not require changing old experiments.
 
-## Minimal runnable template
-
-See:
-- `/Users/leo/Library/CloudStorage/GoogleDrive-l.massai@epfl.ch/My Drive/Code/Projects/Performance_Boosting/pb_core_minimal_example.py`
-
 Quick smoke run:
 
 ```bash

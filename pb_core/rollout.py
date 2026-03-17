@@ -7,7 +7,7 @@ from typing import Callable
 
 import torch
 
-from pb_controller import PBController, as_bt
+from .controller import PBController, as_bt
 
 
 @dataclass

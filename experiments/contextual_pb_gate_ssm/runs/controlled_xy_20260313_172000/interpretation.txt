@@ -1,1 +1,0 @@
-Factorized M_b x M_p: success rate 0.938 | M_p-only (matched params): 0.935 | Disturbance-only PB+SSM: 0.258 | Nominal pre-stabilization: 0.188 | Success requires clearing the moving wall opening and ending near the origin.

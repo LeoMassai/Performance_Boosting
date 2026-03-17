@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from pb_controller import as_bt
+from pb_core import as_bt
 
 
 class DoubleIntegratorNominal:

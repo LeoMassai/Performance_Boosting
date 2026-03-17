@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import spectral_norm
 
-from pb_controller import as_bt
+from pb_core import as_bt
 
 
 class BoundedMLPOperator(nn.Module):

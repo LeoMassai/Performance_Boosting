@@ -7,7 +7,7 @@ from typing import Callable
 
 import torch
 
-from pb_controller import FactorizedOperator, PBController
+from .controller import FactorizedOperator, PBController
 
 
 @dataclass
@@ -29,14 +29,20 @@ def build_factorized_controller(
     u_nominal: Callable | None = None,
     mp_context_lifter=None,
     mp_only: bool = False,
+    w_augmenter=None,
 ) -> PBController:
     """
     Assemble PBController from nominal plant + factorized operators.
 
     This is a thin convenience wrapper with explicit defaults.
     Set mp_only=True to bypass M_b entirely (mb may be None in that case).
+    Set w_augmenter to a WIntegralAugmenter (or compatible module) to augment
+    the disturbance w before it reaches M_p and M_b.
     """
-    op = FactorizedOperator(mp=mp, mb=mb, mp_context_lifter=mp_context_lifter, mp_only=mp_only)
+    op = FactorizedOperator(
+        mp=mp, mb=mb, mp_context_lifter=mp_context_lifter,
+        mp_only=mp_only, w_augmenter=w_augmenter,
+    )
     return PBController(
         plant=nominal_plant,
         operator=op,

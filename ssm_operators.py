@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from pb_controller import as_bt
+from pb_core import as_bt
 
 
 class MpDeepSSM(nn.Module):

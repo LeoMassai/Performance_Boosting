@@ -1,0 +1,340 @@
+"""
+Performance Boosting (PB) controller core.
+
+- Causal, step-by-step operation using (B, T, N) tensors (T=1 typical).
+- Reconstructs disturbance w from nominal model and last state/control.
+- Modular plant and operator interfaces.
+- Supports multi-input operators and factorization: M(w,z) = M_p(w) X M_b(w,z).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Optional, Protocol, Tuple
+
+import torch
+import torch.nn as nn
+
+
+def as_bt(x: torch.Tensor) -> torch.Tensor:
+    """Ensure input is shaped (B, T, N). Accepts (B, N) or (B, T, N)."""
+    if x.dim() == 2:
+        return x.unsqueeze(1)
+    if x.dim() == 3:
+        return x
+    raise ValueError(f"Expected tensor with 2 or 3 dims, got shape {tuple(x.shape)}")
+
+
+def strip_t(x: torch.Tensor) -> torch.Tensor:
+    """If tensor is (B, 1, N), return (B, N). Otherwise return as-is."""
+    if x.dim() == 3 and x.shape[1] == 1:
+        return x[:, 0, :]
+    return x
+
+
+class NominalPlant(Protocol):
+    """Protocol for nominal plant dynamics used to reconstruct disturbance w."""
+
+    def nominal_dynamics(self, x: torch.Tensor, u: torch.Tensor, t: Optional[int] = None) -> torch.Tensor:
+        """Return x_next_nominal given x and u. Shapes (B, T, Nx) -> (B, T, Nx)."""
+        ...
+
+
+class WIntegralAugmenter(nn.Module):
+    """Augments w_t with its causal leaky integral w̄_t = γ * w̄_{t-1} + w_t.
+
+    Output: cat([w_t, w̄_t], dim=-1)  →  shape (B, T, 2*Nw).
+
+    When the true disturbance is near-zero after t=0 (w_0 = x_0, w_{t≥1} ≈ 0),
+    the integral reduces to γ^t * x_0 — a smoothly decaying encoding of the
+    initial condition that keeps the operator input non-trivial throughout the
+    rollout, making training significantly easier.
+
+    Interacts transparently with context lifting: the output replaces the raw w
+    fed to M_p and M_b, while lift(z) is concatenated separately as usual.
+    """
+
+    def __init__(self, decay: float = 0.97):
+        super().__init__()
+        if not (0.0 < decay < 1.0):
+            raise ValueError(f"decay must be in (0, 1), got {decay}")
+        self.decay = decay
+        self._bar_w: Optional[torch.Tensor] = None
+
+    def reset(self) -> None:
+        self._bar_w = None
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        """w: (B, T, Nw) — expects T=1 in step-by-step usage."""
+        if self._bar_w is None:
+            self._bar_w = w
+        else:
+            self._bar_w = self.decay * self._bar_w + w
+        return torch.cat([w, self._bar_w], dim=-1)
+
+
+class OperatorBase(nn.Module):
+    """Base class for PB operators. Accepts w and optional z."""
+
+    def forward(self, w: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        """Optional: reset internal dynamical state."""
+        return None
+
+
+class GenericOperator(OperatorBase):
+    """Wraps an arbitrary module. If z is provided, concatenates [w,z] by default."""
+
+    def __init__(self, module: nn.Module, concat_z: bool = True):
+        super().__init__()
+        self.module = module
+        self.concat_z = concat_z
+
+    def forward(self, w: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if z is None or not self.concat_z:
+            return self.module(w)
+        return self.module(torch.cat([w, z], dim=-1))
+
+    def reset(self) -> None:
+        if hasattr(self.module, "reset"):
+            self.module.reset()
+
+
+def boxtimes_timewise(A: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Timewise matrix–vector product.
+
+    Preferred shapes:
+      A: (B, T, r, s)
+      v: (B, T, s)
+      y: (B, T, r)
+
+    Also accepts:
+      A: (T, B, r, s)
+      v: (T, B, s)
+      y: (T, B, r)
+    """
+    if A.ndim != 4:
+        raise ValueError(f"A must be 4D (B,T,r,s) or (T,B,r,s). Got shape {tuple(A.shape)}")
+    if v.ndim != 3:
+        raise ValueError(f"v must be 3D (B,T,s) or (T,B,s). Got shape {tuple(v.shape)}")
+    if A.shape[:2] != v.shape[:2]:
+        raise ValueError(
+            f"Leading dims of A and v must match. Got A{tuple(A.shape)} vs v{tuple(v.shape)}"
+        )
+    if A.shape[-1] != v.shape[-1]:
+        raise ValueError(
+            f"Incompatible inner dims: A.shape[-1]={A.shape[-1]} vs v.shape[-1]={v.shape[-1]}"
+        )
+    return torch.einsum("btrs,bts->btr", A, v)
+
+
+class TimewiseMatVec(nn.Module):
+    """nn.Module wrapper for the timewise matrix–vector product."""
+
+    def forward(self, A: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return boxtimes_timewise(A, v)
+
+
+class FactorizedOperator(OperatorBase):
+    """M(w,z) = M_p(w) X M_b(w,z) with configurable product X.
+
+    When mp_only=True the M_b branch is skipped entirely and the operator
+    reduces to u = M_p(w) (or M_p([w, lift(z)]) when mp_context_lifter is
+    set).  In this mode mb may be None and M_p must already output (B,T,nu).
+    """
+
+    def __init__(
+        self,
+        mp: nn.Module,
+        mb: Optional[nn.Module] = None,
+        mp_context_lifter: Optional[nn.Module] = None,
+        product_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = boxtimes_timewise,
+        mp_only: bool = False,
+        w_augmenter: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        if not mp_only and mb is None:
+            raise ValueError("mb must be provided when mp_only=False.")
+        self.mp = mp
+        self.mb = mb
+        self.mp_context_lifter = mp_context_lifter
+        self.product_fn = product_fn
+        self.mp_only = mp_only
+        self.w_augmenter = w_augmenter
+
+    def reset(self) -> None:
+        if hasattr(self.mp, "reset"):
+            self.mp.reset()
+        if self.mb is not None and hasattr(self.mb, "reset"):
+            self.mb.reset()
+        if self.mp_context_lifter is not None and hasattr(self.mp_context_lifter, "reset"):
+            self.mp_context_lifter.reset()
+        if self.w_augmenter is not None and hasattr(self.w_augmenter, "reset"):
+            self.w_augmenter.reset()
+
+    def forward(self, w: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.w_augmenter is not None:
+            w = self.w_augmenter(w)  # (B, T, 2*Nw) — M_p and M_b both see augmented w
+        if self.mp_context_lifter is None:
+            w_mp = w
+        else:
+            if z is None:
+                raise ValueError("z must be provided when mp_context_lifter is enabled.")
+            w_bt = as_bt(w)
+            z_lift = self.mp_context_lifter(z)
+            z_lift_bt = as_bt(z_lift)
+            if w_bt.shape[:2] != z_lift_bt.shape[:2]:
+                raise ValueError(
+                    "w and lifted z must share leading dims. "
+                    f"Got w{tuple(w_bt.shape)} vs z_lift{tuple(z_lift_bt.shape)}"
+                )
+            w_mp = torch.cat([w_bt, z_lift_bt], dim=-1)
+        v = self.mp(w_mp)
+        if self.mp_only:
+            return v
+        A = self.mb(w, z) if z is not None else self.mb(w)
+        return self.product_fn(A, v)
+
+
+@dataclass
+class PBState:
+    x_tm1: torch.Tensor
+    u_tm1: torch.Tensor
+    w0: torch.Tensor
+    has_prev: bool
+
+
+class PBController(nn.Module):
+    """
+    Performance Boosting controller.
+
+    At time t, the controller receives x_t and optional z_t.
+    It reconstructs w_t = x_t - f_nom(x_{t-1}, u_{t-1}).
+    Then u_boost_t = M(w_t, z_t) (causal).
+    Optionally adds a nominal policy u_nom(x_t).
+
+    Shapes are (B, T, N), with T=1 in step-by-step usage.
+    """
+
+    def __init__(
+        self,
+        plant: NominalPlant,
+        operator: OperatorBase,
+        u_nominal: Optional[Callable[[torch.Tensor, Optional[int]], torch.Tensor]] = None,
+        u_dim: Optional[int] = None,
+        detach_state: bool = True,
+    ):
+        super().__init__()
+        self.plant = plant
+        self.operator = operator
+        self.u_nominal = u_nominal
+        self.u_dim = u_dim
+        self.detach_state = detach_state
+        self.state: Optional[PBState] = None
+
+    def reset(
+        self,
+        x_init: torch.Tensor,
+        u_init: Optional[torch.Tensor] = None,
+        w0: Optional[torch.Tensor] = None,
+    ) -> None:
+        x_init = as_bt(x_init)
+        if u_init is None:
+            if self.u_dim is None:
+                raise ValueError("u_init is None and u_dim is not set.")
+            u_init = torch.zeros(x_init.shape[0], x_init.shape[1], self.u_dim, device=x_init.device)
+        u_init = as_bt(u_init)
+        if w0 is None:
+            w0 = torch.zeros_like(x_init)
+        else:
+            w0 = as_bt(w0)
+            if w0.shape != x_init.shape:
+                raise ValueError(
+                    f"w0 must match x_init shape. Got w0{tuple(w0.shape)} vs x_init{tuple(x_init.shape)}"
+                )
+        self.state = PBState(x_tm1=x_init, u_tm1=u_init, w0=w0, has_prev=False)
+        self.operator.reset()
+
+    def _compute_w_t(self, x_t: torch.Tensor, t: Optional[int] = None) -> torch.Tensor:
+        assert self.state is not None
+        if not self.state.has_prev:
+            return self.state.w0
+        x_tm1 = self.state.x_tm1
+        u_tm1 = self.state.u_tm1
+        # Reconstruct disturbance for transition (t-1 -> t):
+        #   x_t = f_{t-1}(x_{t-1}, u_{t-1}) + w_t
+        t_prev = None if t is None else (t - 1)
+        x_nom = self.plant.nominal_dynamics(x_tm1, u_tm1, t_prev)
+        return x_t - x_nom
+
+    def forward_step(
+        self,
+        x_t: torch.Tensor,
+        z_t: Optional[torch.Tensor] = None,
+        t: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute u_t and return (u_t, w_t)."""
+        if self.state is None:
+            raise RuntimeError("Call reset(x_init) before forward_step().")
+
+        x_t = as_bt(x_t)
+        z_t = as_bt(z_t) if z_t is not None else None
+
+        w_t = self._compute_w_t(x_t, t)
+        u_boost = self.operator(w_t, z_t)
+
+        if self.u_nominal is None:
+            u_nom = torch.zeros_like(u_boost)
+        else:
+            u_nom = self.u_nominal(x_t, t)
+            u_nom = as_bt(u_nom)
+
+        u_t = u_nom + u_boost
+
+        if self.detach_state:
+            self.state.x_tm1 = x_t.detach()
+            self.state.u_tm1 = u_t.detach()
+        else:
+            self.state.x_tm1 = x_t
+            self.state.u_tm1 = u_t
+        self.state.has_prev = True
+
+        return u_t, w_t
+
+    def set_last_applied_control(self, u_applied: torch.Tensor) -> None:
+        """Update internal memory with the control actually applied to the true plant."""
+        if self.state is None:
+            raise RuntimeError("Call reset(x_init) before set_last_applied_control().")
+
+        u_applied = as_bt(u_applied)
+        if u_applied.shape != self.state.u_tm1.shape:
+            raise ValueError(
+                f"u_applied shape mismatch: got {tuple(u_applied.shape)} vs expected {tuple(self.state.u_tm1.shape)}"
+            )
+
+        self.state.u_tm1 = u_applied.detach() if self.detach_state else u_applied
+
+    def forward_sequence(
+        self,
+        x_seq: torch.Tensor,
+        z_seq: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process a full sequence causally (B, T, Nx). Returns u_seq and w_seq."""
+        if self.state is None:
+            raise RuntimeError("Call reset(x_init) before forward_sequence().")
+
+        x_seq = as_bt(x_seq)
+        z_seq = as_bt(z_seq) if z_seq is not None else None
+
+        _, T, _ = x_seq.shape
+        u_out = []
+        w_out = []
+        for t in range(T):
+            z_t = z_seq[:, t:t + 1, :] if z_seq is not None else None
+            u_t, w_t = self.forward_step(x_seq[:, t:t + 1, :], z_t, t)
+            u_out.append(u_t)
+            w_out.append(w_t)
+        return torch.cat(u_out, dim=1), torch.cat(w_out, dim=1)
