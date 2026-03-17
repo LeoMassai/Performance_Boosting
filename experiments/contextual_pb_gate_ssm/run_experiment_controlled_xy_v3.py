@@ -112,13 +112,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Geometry and dynamics.
     parser.add_argument("--horizon", type=int, default=160)
-    parser.add_argument("--plot_horizon", type=int, default=200,
+    parser.add_argument("--plot_horizon", type=int, default=270,
                         help="Extended horizon for plots only. After --horizon steps the PB "
                              "correction is set to zero and the nominal plant is simulated forward. "
                              "Defaults to --horizon (no extension).")
     parser.add_argument("--use_plot_horizon", dest="use_plot_horizon", action="store_true")
     parser.add_argument("--no_plot_horizon", dest="use_plot_horizon", action="store_false")
     parser.set_defaults(use_plot_horizon=True)
+    parser.add_argument("--lift_comparison", dest="lift_comparison", action="store_true",
+                        help="Add context_no_lift variant: factorized M_b x M_p without "
+                             "lifting on M_p, paired against the default mp_only_context "
+                             "(M_p-only with lift) to isolate the effect of lifting.")
+    parser.add_argument("--no_lift_comparison", dest="lift_comparison", action="store_false")
+    parser.set_defaults(lift_comparison=False)
+    parser.add_argument("--use_storyboard", dest="use_storyboard", action="store_true")
+    parser.add_argument("--no_storyboard", dest="use_storyboard", action="store_false")
+    parser.set_defaults(use_storyboard=True)
+    parser.add_argument("--use_storyboard_compact", dest="use_storyboard_compact", action="store_true")
+    parser.add_argument("--no_storyboard_compact", dest="use_storyboard_compact", action="store_false")
+    parser.set_defaults(use_storyboard_compact=True)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
     parser.add_argument("--pre_kd", type=float, default=0.80)
@@ -270,18 +282,22 @@ def find_matched_ssm_d_model(
 
 
 def variant_specs(args=None) -> list[tuple[str, str]]:
-    if args is not None and getattr(args, "simple_comparison", False):
+    lift_cmp = args is not None and getattr(args, "lift_comparison", False)
+    if args is not None and getattr(args, "simple_comparison", False) and not lift_cmp:
         return [
             ("nominal", "Nominal only"),
             ("disturbance_only", "PB+SSM: no context"),
             ("context", "PB+SSM: factorized M_b x M_p"),
         ]
-    return [
+    specs = [
         ("nominal", "Nominal only"),
         ("disturbance_only", "PB+SSM: no context"),
         ("context", "PB+SSM: factorized M_b x M_p"),
-        ("mp_only_context", "PB+SSM: M_p-only (matched params)"),
+        ("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"),
     ]
+    if args is not None and getattr(args, "lift_comparison", False):
+        specs.append(("context_no_lift", "PB+SSM: factorized M_b x M_p (no lift)"))
+    return specs
 
 
 FULL_CONTEXT_DIM = 11
@@ -574,6 +590,7 @@ def build_controller(
     args: argparse.Namespace,
     *,
     mp_only: bool = False,
+    force_no_lift: bool = False,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
 ) -> tuple[PBController, DoubleIntegratorTrue]:
@@ -593,7 +610,7 @@ def build_controller(
     mp_context_lifter = None
     mp_in_dim = nx
 
-    if bool(args.mp_context_lift):
+    if bool(args.mp_context_lift) and not force_no_lift:
         mp_context_lifter = LpContextLifter(
             z_dim=z_dim,
             out_dim=int(args.mp_context_lift_dim),
@@ -763,7 +780,7 @@ def rollout_variant(
             expected_cross_index=expected_cross_index,
             training=training,
         )
-    if mode in ("context", "mp_only_context"):
+    if mode in ("context", "mp_only_context", "context_no_lift"):
         return rollout_pb_variant(
             args=args,
             batch=batch,
@@ -958,6 +975,7 @@ def train_controller(
     expected_cross_index: int,
     warm_start_state: dict | None = None,
     mp_only: bool = False,
+    force_no_lift: bool = False,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
 ) -> tuple[PBController | None, DoubleIntegratorTrue | None, list[dict], dict]:
@@ -978,12 +996,13 @@ def train_controller(
         device,
         args,
         mp_only=mp_only,
+        force_no_lift=force_no_lift,
         ssm_d_model_override=ssm_d_model_override,
         ssm_layers_override=ssm_layers_override,
     )
     print(f"[{mode}] trainable params: {count_params(controller):,}")
 
-    # Warm-start from a previously trained state (e.g. disturbance_only → context)
+    # Warm-start from a previously trained state (e.g. disturbance_only -> context)
     if warm_start_state is not None:
         missing, unexpected = controller.load_state_dict(warm_start_state, strict=False)
         print(f"[{mode}] warm-started from provided checkpoint "
@@ -1132,6 +1151,7 @@ def variant_colors() -> dict[str, str]:
         "disturbance_only": "#d97706",
         "context": "#0f766e",
         "mp_only_context": "#7c3aed",
+        "context_no_lift": "#db2777",
     }
 
 
@@ -1341,6 +1361,11 @@ def draw_wall(ax, wall_x: float, gate_center: float, half_width: float, y_limit:
     ax.plot([wall_x, wall_x], [-y_limit, gate_center - half_width], color="black", lw=3.0)
     ax.plot([wall_x, wall_x], [gate_center + half_width, y_limit], color="black", lw=3.0)
     ax.plot([wall_x, wall_x], [gate_center - half_width, gate_center + half_width], color="white", lw=5.0)
+    # Corridor walls
+    ax.axhline(y_limit, color="#6b7280", lw=1.5, ls="-", zorder=1)
+    ax.axhline(-y_limit, color="#6b7280", lw=1.5, ls="-", zorder=1)
+    ax.axhspan(y_limit, y_limit * 2, color="#e5e7eb", alpha=0.6, zorder=0)
+    ax.axhspan(-y_limit * 2, -y_limit, color="#e5e7eb", alpha=0.6, zorder=0)
 
 
 def plot_trajectory_samples(
@@ -1608,7 +1633,7 @@ def _animate_one_sample(
     gate_traj = test_batch.gate_y[sample_idx].numpy()
     start_np  = test_batch.start[sample_idx].numpy()
 
-    # per-variant trajectories: prepend start → (T+1, 2)
+    # per-variant trajectories: prepend start -> (T+1, 2)
     trajs: dict[str, np.ndarray] = {}
     for mode, _ in variant_order:
         xy = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()
@@ -1648,6 +1673,10 @@ def _animate_one_sample(
     # ── static arena elements ─────────────────────────────────────────────────
     ax_arena.set_xlim(-0.15, x_max)
     ax_arena.set_ylim(-corr - 0.12, corr + 0.12)
+    ax_arena.axhline(corr, color="#475569", lw=1.5, ls="-", zorder=1)
+    ax_arena.axhline(-corr, color="#475569", lw=1.5, ls="-", zorder=1)
+    ax_arena.axhspan(corr, corr + 0.5, color="#334155", alpha=0.5, zorder=0)
+    ax_arena.axhspan(-corr - 0.5, -corr, color="#334155", alpha=0.5, zorder=0)
     ax_arena.set_xlabel("x position")
     ax_arena.set_ylabel("y position")
     ax_arena.scatter([0.0], [0.0], color="#f8fafc", marker="*", s=160, zorder=6,
@@ -1754,14 +1783,14 @@ def _animate_one_sample(
 
     gif_path = run_dir / f"rollout_animation_{file_tag}.gif"
     anim.save(str(gif_path), writer=PillowWriter(fps=1000 // interval_ms))
-    print(f"  Animation saved → {gif_path}")
+    print(f"  Animation saved -> {gif_path}")
 
     try:
         from matplotlib.animation import FFMpegWriter
         mp4_path = run_dir / f"rollout_animation_{file_tag}.mp4"
         anim.save(str(mp4_path),
                   writer=FFMpegWriter(fps=1000 // interval_ms, bitrate=1200))
-        print(f"  Animation saved → {mp4_path}")
+        print(f"  Animation saved -> {mp4_path}")
     except Exception:
         pass
 
@@ -1978,8 +2007,13 @@ def plot_adversarial_switching(
                 lw = 2.2 if mode in ("context", "mp_only_context") else 1.4
                 ax_traj.plot(traj[:, 0], traj[:, 1], color=colors[mode], lw=lw,
                              alpha=0.8, label=label if idx == int(adv_indices[0]) else "")
+        corr_adv = float(args.corridor_limit)
+        ax_traj.axhline(corr_adv, color="#6b7280", lw=1.5, ls="-", zorder=1)
+        ax_traj.axhline(-corr_adv, color="#6b7280", lw=1.5, ls="-", zorder=1)
+        ax_traj.axhspan(corr_adv, corr_adv * 2, color="#e5e7eb", alpha=0.6, zorder=0)
+        ax_traj.axhspan(-corr_adv * 2, -corr_adv, color="#e5e7eb", alpha=0.6, zorder=0)
         ax_traj.set_xlim(-0.15, float(args.start_x_max) + 0.15)
-        ax_traj.set_ylim(-float(args.corridor_limit) - 0.1, float(args.corridor_limit) + 0.1)
+        ax_traj.set_ylim(-corr_adv - 0.1, corr_adv + 0.1)
         ax_traj.set_xlabel("x position")
         ax_traj.set_ylabel("y position")
         ax_traj.set_title("Trajectories: adversarial episodes", fontweight="bold")
@@ -2067,8 +2101,14 @@ def plot_sample_trajectory(
     )
 
     # ── Left: top-down view ───────────────────────────────────────────────────
-    # Wall
+    # Corridor walls
     y_lim = float(args.corridor_limit) * 1.05
+    corr = float(args.corridor_limit)
+    ax_top.axhline(corr, color="#6b7280", lw=1.5, ls="-", zorder=1)
+    ax_top.axhline(-corr, color="#6b7280", lw=1.5, ls="-", zorder=1)
+    ax_top.axhspan(corr, y_lim, color="#e5e7eb", alpha=0.6, zorder=0)
+    ax_top.axhspan(-y_lim, -corr, color="#e5e7eb", alpha=0.6, zorder=0)
+    # Transverse wall
     ax_top.axvline(wall_x, color="#ef4444", lw=2.0, zorder=3, label="Wall")
 
     # Gate opening at crossing time (use context variant if available, else first variant)
@@ -2158,7 +2198,436 @@ def plot_sample_trajectory(
 
     out = run_dir / "sample_trajectory.pdf"
     fig.savefig(str(out), bbox_inches="tight")
-    print(f"Saved sample trajectory figure → {out}")
+    print(f"Saved sample trajectory figure -> {out}")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_trajectory_storyboard(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    expected_cross_index: int,
+    show_plots: bool = False,
+    sample_idx: int = 0,
+) -> None:
+    """
+    Four-panel storyboard figure for a single episode — paper-ready static
+    replacement for the animated GIF.
+
+    Automatically selects an episode with ≥ 3 gate switches so each panel
+    shows the gate opening at a visibly different y position:
+      (1) Mid of gate level 1  ->  agent approaching, gate at position A
+      (2) Mid of gate level 2  ->  gate jumped to B, agent adapts
+      (3) Mid of gate level 3  ->  gate jumped to C, agent adapts again
+      (4) Wall crossing        ->  agent passes through final gate position
+
+    A thin gate-schedule strip below all panels shows the full g(t) step
+    function with vertical cursors marking each snapshot, providing clear
+    temporal context without needing animation.
+    """
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    from matplotlib import pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.gridspec import GridSpec
+
+    setup_plot_style(plt)
+    colors = variant_colors()
+    labels = {mode: label for mode, label in variant_order}
+
+    T      = int(args.horizon)
+    wall_x = float(args.wall_x)
+    half_w = float(args.gate_half_width)
+    corr   = float(args.corridor_limit)
+    amp    = float(args.gate_amplitude)
+    x_min_ax = -0.15
+    x_max_ax = float(args.start_x_max) * 1.08
+    y_lim    = corr * 1.08
+
+    freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
+
+    # ── Find a sample with ≥ 3 gate switches before freeze ────────────────────
+    def _count_switches(gate: np.ndarray) -> int:
+        return int(np.sum(np.abs(np.diff(gate[:freeze_step])) > 0.05))
+
+    chosen = sample_idx
+    if _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
+        n_batch = test_batch.gate_y.shape[0]
+        for i in range(n_batch):
+            if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
+                chosen = i
+                break
+
+    gate_np  = test_batch.gate_y[chosen].numpy()   # (T,)
+    start_np = test_batch.start[chosen].numpy()
+    cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
+
+    # ── Find gate switch points and level segments ─────────────────────────────
+    # switch_pts: indices where the gate value changes (within [0, freeze_step))
+    switch_pts = np.where(np.abs(np.diff(gate_np[:freeze_step])) > 0.05)[0] + 1
+    # Level segments: list of (t_start, t_end) before freeze
+    seg_starts = np.concatenate([[0], switch_pts])
+    seg_ends   = np.concatenate([switch_pts, [freeze_step]])
+
+    # Pick the first 3 level segments whose midpoints are well inside [0, freeze_step)
+    def _mid(s, e):
+        return int(s + max(1, (e - s) // 2))
+
+    level_mids = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
+
+    # 5 snapshot times: mid of levels 1, 2, 3 -> wall crossing -> final
+    t1 = level_mids[0] if len(level_mids) > 0 else max(1, freeze_step // 6)
+    t2 = level_mids[1] if len(level_mids) > 1 else freeze_step // 3
+    t3 = level_mids[2] if len(level_mids) > 2 else 2 * freeze_step // 3
+    t4 = min(cross_idx, T - 1)
+    t5 = T - 1
+
+    snapshot_steps = [t1, t2, t3, t4, t5]
+    snapshot_labels = [
+        f"$t={t1}$\n$g={gate_np[t1]:+.2f}$",
+        f"$t={t2}$\n$g={gate_np[t2]:+.2f}$",
+        f"$t={t3}$\n$g={gate_np[t3]:+.2f}$",
+        f"$t={t4}$  (crossing)\n$g={gate_np[min(t4, T-1)]:+.2f}$",
+        f"$t={t5}$  (final)",
+    ]
+    # Cursor colors for the gate strip (one per snapshot)
+    cursor_colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#7c3aed"]
+
+    # ── Trajectories (prepend start -> T+1 pts) ────────────────────────────────
+    trajs: dict[str, np.ndarray] = {}
+    for mode, _ in variant_order:
+        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        trajs[mode] = np.vstack([start_np[:2], xy])
+
+    # ── Layout: 5 arena panels (tall) + 1 gate strip (short) ─────────────────
+    fig = plt.figure(figsize=(17.0, 5.2))
+    gs  = GridSpec(
+        2, 5,
+        figure=fig,
+        height_ratios=[3.2, 1.0],
+        hspace=0.38,
+        wspace=0.10,
+    )
+    arena_axes = [fig.add_subplot(gs[0, col]) for col in range(5)]
+    ax_gate    = fig.add_subplot(gs[1, :])   # full-width gate strip
+
+    # ── Arena panels ──────────────────────────────────────────────────────────
+    for col, (ax, t_snap, snap_label) in enumerate(
+        zip(arena_axes, snapshot_steps, snapshot_labels)
+    ):
+        # Corridor walls
+        ax.axhspan(corr, y_lim,   color="#e5e7eb", alpha=0.7, zorder=0)
+        ax.axhspan(-y_lim, -corr, color="#e5e7eb", alpha=0.7, zorder=0)
+        ax.axhline( corr, color="#6b7280", lw=1.2, zorder=1)
+        ax.axhline(-corr, color="#6b7280", lw=1.2, zorder=1)
+
+        # Transverse wall + gate opening at gate_y[t_snap]
+        g_t = float(gate_np[min(t_snap, T - 1)])
+        ax.fill_betweenx([-y_lim, g_t - half_w],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#9ca3af", zorder=3)
+        ax.fill_betweenx([g_t + half_w, y_lim],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#9ca3af", zorder=3)
+        ax.fill_betweenx([g_t - half_w, g_t + half_w],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#bbf7d0", alpha=0.85, zorder=3)
+
+        # Ghost: full trajectory (very faded)
+        for mode, _ in variant_order:
+            ax.plot(trajs[mode][:, 0], trajs[mode][:, 1],
+                    color=colors.get(mode, "#888"), lw=1.0, alpha=0.10, zorder=2)
+
+        # Partial trail + current position dot
+        for mode, _ in variant_order:
+            trail = trajs[mode][:t_snap + 2]
+            ax.plot(trail[:, 0], trail[:, 1],
+                    color=colors.get(mode, "#888"), lw=2.0, alpha=0.90, zorder=4)
+            ax.scatter(trail[-1, 0], trail[-1, 1],
+                       color=colors.get(mode, "#888"), s=45, zorder=6,
+                       edgecolors="white", linewidths=0.8)
+
+        # Start marker (first panel only)
+        if col == 0:
+            ax.scatter(start_np[0], start_np[1], color="#6b7280", s=50,
+                       marker="o", zorder=5, edgecolors="white", linewidths=0.8)
+
+        # Goal
+        ax.scatter(0.0, 0.0, color="#111827", marker="*", s=110, zorder=7)
+
+        # Coloured snapshot-cursor border
+        for spine in ax.spines.values():
+            spine.set_edgecolor(cursor_colors[col])
+            spine.set_linewidth(1.8)
+
+        ax.set_xlim(x_max_ax, x_min_ax)   # inverted: agent moves right→left
+        ax.set_ylim(-y_lim, y_lim)
+        ax.set_title(snap_label, fontsize=8.5, fontweight="bold", pad=4,
+                     color=cursor_colors[col])
+        ax.set_xlabel("$x$ (m)", fontsize=8)
+        if col == 0:
+            ax.set_ylabel("$y$ (m)", fontsize=8)
+        else:
+            ax.set_yticklabels([])
+        ax.tick_params(labelsize=7)
+
+    # ── Gate schedule strip ────────────────────────────────────────────────────
+    t_ax = np.arange(T)
+    ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.4,
+                 label="$g_t$  (gate centre)")
+    ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                         step="post", color="#bbf7d0", alpha=0.45)
+    ax_gate.axvline(freeze_step, color="#94a3b8", lw=1.0, ls="--", zorder=2,
+                    label=f"freeze $t={freeze_step}$")
+    # Snapshot cursors
+    for t_snap, cc in zip(snapshot_steps, cursor_colors):
+        ax_gate.axvline(t_snap, color=cc, lw=1.6, ls=":", zorder=3)
+        ax_gate.scatter([t_snap], [gate_np[min(t_snap, T - 1)]],
+                        color=cc, s=40, zorder=4, edgecolors="white", linewidths=0.6)
+
+    ax_gate.set_xlim(0, T - 1)
+    ax_gate.set_ylim(-amp * 1.15, amp * 1.15)
+    ax_gate.set_xlabel("Step $t$", fontsize=8)
+    ax_gate.set_ylabel("$g_t$", fontsize=8)
+    ax_gate.tick_params(labelsize=7)
+    ax_gate.legend(fontsize=7, loc="upper right", ncol=2)
+
+    # ── Shared legend ──────────────────────────────────────────────────────────
+    legend_handles = [
+        Line2D([0], [0], color=colors.get(m, "#888"), lw=2, label=labels[m])
+        for m, _ in variant_order if m in test_metrics
+    ]
+    legend_handles += [
+        Line2D([0], [0], color="#6b7280", lw=1.2, label="Corridor / wall"),
+        plt.Rectangle((0, 0), 1, 1, fc="#bbf7d0", alpha=0.85, label="Gate opening"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=len(legend_handles),
+        fontsize=8,
+        bbox_to_anchor=(0.5, -0.04),
+        frameon=False,
+    )
+
+    fig.suptitle(
+        f"Trajectory storyboard — episode #{chosen}  "
+        f"({_count_switches(gate_np)} gate switches before freeze)",
+        fontsize=10, fontweight="bold", y=1.01,
+    )
+
+    out = run_dir / "trajectory_storyboard.pdf"
+    fig.savefig(str(out), bbox_inches="tight")
+    print(f"Saved trajectory storyboard -> {out}")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_trajectory_storyboard_compact(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    expected_cross_index: int,
+    show_plots: bool = False,
+    sample_idx: int = 0,
+) -> None:
+    """
+    Compact paper-ready storyboard: 5 arena snapshots in a single tight row
+    (≈7 inches wide, fits a two-column journal figure) plus a slim gate-strip
+    below.  Same episode / snapshot logic as the full storyboard.
+    """
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    from matplotlib import pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.gridspec import GridSpec
+
+    setup_plot_style(plt)
+    colors = variant_colors()
+    labels = {mode: label for mode, label in variant_order}
+
+    T      = int(args.horizon)
+    wall_x = float(args.wall_x)
+    half_w = float(args.gate_half_width)
+    corr   = float(args.corridor_limit)
+    amp    = float(args.gate_amplitude)
+    x_min_ax = -0.15
+    x_max_ax = float(args.start_x_max) * 1.08
+    y_lim    = corr * 1.08
+
+    freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
+
+    def _count_switches(gate: np.ndarray) -> int:
+        return int(np.sum(np.abs(np.diff(gate[:freeze_step])) > 0.05))
+
+    # Reuse same sample-selection logic as full storyboard
+    chosen = sample_idx
+    if _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
+        for i in range(test_batch.gate_y.shape[0]):
+            if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
+                chosen = i
+                break
+
+    gate_np   = test_batch.gate_y[chosen].numpy()
+    start_np  = test_batch.start[chosen].numpy()
+    cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
+
+    switch_pts = np.where(np.abs(np.diff(gate_np[:freeze_step])) > 0.05)[0] + 1
+    seg_starts = np.concatenate([[0], switch_pts])
+    seg_ends   = np.concatenate([switch_pts, [freeze_step]])
+
+    def _mid(s, e):
+        return int(s + max(1, (e - s) // 2))
+
+    level_mids  = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
+    t1 = level_mids[0] if len(level_mids) > 0 else max(1, freeze_step // 6)
+    t2 = level_mids[1] if len(level_mids) > 1 else freeze_step // 3
+    t3 = level_mids[2] if len(level_mids) > 2 else 2 * freeze_step // 3
+    t4 = min(cross_idx, T - 1)
+    t5 = T - 1
+
+    snapshot_steps  = [t1, t2, t3, t4, t5]
+    # Compact titles: single line, no gate value (shown in strip instead)
+    snapshot_titles = [
+        f"(a) $t={t1}$",
+        f"(b) $t={t2}$",
+        f"(c) $t={t3}$",
+        f"(d) $t={t4}$",
+        f"(e) $t={t5}$",
+    ]
+    cursor_colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#7c3aed"]
+
+    trajs: dict[str, np.ndarray] = {}
+    for mode, _ in variant_order:
+        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        trajs[mode] = np.vstack([start_np[:2], xy])
+
+    # ── Compact layout: 5 narrow panels + slim gate strip ─────────────────────
+    fig = plt.figure(figsize=(7.2, 3.4))
+    gs  = GridSpec(
+        2, 5,
+        figure=fig,
+        height_ratios=[2.8, 0.8],
+        hspace=0.30,
+        wspace=0.06,
+    )
+    arena_axes = [fig.add_subplot(gs[0, col]) for col in range(5)]
+    ax_gate    = fig.add_subplot(gs[1, :])
+
+    for col, (ax, t_snap, title) in enumerate(
+        zip(arena_axes, snapshot_steps, snapshot_titles)
+    ):
+        # Corridor walls
+        ax.axhspan(corr, y_lim,   color="#e5e7eb", alpha=0.7, zorder=0)
+        ax.axhspan(-y_lim, -corr, color="#e5e7eb", alpha=0.7, zorder=0)
+        ax.axhline( corr, color="#6b7280", lw=0.8, zorder=1)
+        ax.axhline(-corr, color="#6b7280", lw=0.8, zorder=1)
+
+        # Wall + gate
+        g_t = float(gate_np[min(t_snap, T - 1)])
+        ax.fill_betweenx([-y_lim, g_t - half_w],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#9ca3af", zorder=3)
+        ax.fill_betweenx([g_t + half_w, y_lim],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#9ca3af", zorder=3)
+        ax.fill_betweenx([g_t - half_w, g_t + half_w],
+                         wall_x - 0.018, wall_x + 0.018,
+                         color="#bbf7d0", alpha=0.85, zorder=3)
+
+        # Ghost + partial trail + dot
+        for mode, _ in variant_order:
+            ax.plot(trajs[mode][:, 0], trajs[mode][:, 1],
+                    color=colors.get(mode, "#888"), lw=0.7, alpha=0.10, zorder=2)
+        for mode, _ in variant_order:
+            trail = trajs[mode][:t_snap + 2]
+            ax.plot(trail[:, 0], trail[:, 1],
+                    color=colors.get(mode, "#888"), lw=1.5, alpha=0.90, zorder=4)
+            ax.scatter(trail[-1, 0], trail[-1, 1],
+                       color=colors.get(mode, "#888"), s=18, zorder=6,
+                       edgecolors="white", linewidths=0.5)
+
+        # Start (first panel) + goal
+        if col == 0:
+            ax.scatter(start_np[0], start_np[1], color="#6b7280", s=18,
+                       marker="o", zorder=5, edgecolors="white", linewidths=0.5)
+        ax.scatter(0.0, 0.0, color="#111827", marker="*", s=55, zorder=7)
+
+        # Coloured border
+        for spine in ax.spines.values():
+            spine.set_edgecolor(cursor_colors[col])
+            spine.set_linewidth(1.2)
+
+        ax.set_xlim(x_max_ax, x_min_ax)
+        ax.set_ylim(-y_lim, y_lim)
+        ax.set_title(title, fontsize=6.5, fontweight="bold", pad=2,
+                     color=cursor_colors[col])
+        ax.set_xlabel("$x$", fontsize=6)
+        ax.tick_params(labelsize=5.5)
+        if col == 0:
+            ax.set_ylabel("$y$ (m)", fontsize=6)
+        else:
+            ax.set_yticklabels([])
+
+    # ── Gate strip ────────────────────────────────────────────────────────────
+    t_ax = np.arange(T)
+    ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.0)
+    ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                         step="post", color="#bbf7d0", alpha=0.45)
+    ax_gate.axvline(freeze_step, color="#94a3b8", lw=0.8, ls="--", zorder=2)
+    for t_snap, cc in zip(snapshot_steps, cursor_colors):
+        ax_gate.axvline(t_snap, color=cc, lw=1.2, ls=":", zorder=3)
+        ax_gate.scatter([t_snap], [gate_np[min(t_snap, T - 1)]],
+                        color=cc, s=18, zorder=4, edgecolors="white", linewidths=0.4)
+    ax_gate.set_xlim(0, T - 1)
+    ax_gate.set_ylim(-amp * 1.2, amp * 1.2)
+    ax_gate.set_xlabel("Step $t$", fontsize=6)
+    ax_gate.set_ylabel("$g_t$", fontsize=6)
+    ax_gate.tick_params(labelsize=5.5)
+
+    # ── Legend (single row, very compact) ─────────────────────────────────────
+    legend_handles = [
+        Line2D([0], [0], color=colors.get(m, "#888"), lw=1.5, label=labels[m])
+        for m, _ in variant_order if m in test_metrics
+    ]
+    legend_handles += [
+        plt.Rectangle((0, 0), 1, 1, fc="#bbf7d0", alpha=0.85, label="Gate"),
+        plt.Rectangle((0, 0), 1, 1, fc="#9ca3af", label="Wall"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=len(legend_handles),
+        fontsize=6,
+        bbox_to_anchor=(0.5, -0.06),
+        frameon=False,
+        handlelength=1.2,
+        columnspacing=0.8,
+    )
+
+    fig.suptitle("Gate-switching navigation — storyboard", fontsize=8,
+                 fontweight="bold", y=1.02)
+
+    out = run_dir / "trajectory_storyboard_compact.pdf"
+    fig.savefig(str(out), bbox_inches="tight", dpi=300)
+    print(f"Saved compact storyboard -> {out}")
     if show_plots:
         plt.show()
     plt.close(fig)
@@ -2358,6 +2827,7 @@ def main() -> None:
             warm_start = {k: v.detach().cpu().clone() for k, v in controllers["disturbance_only"].state_dict().items()}
             print("[context] warm-starting from disturbance_only checkpoint.")
         use_mp_only = (mode == "mp_only_context")
+        use_no_lift = (mode == "context_no_lift")
         controller, plant_true, history, best_val_metrics = train_controller(
             args=args,
             device=device,
@@ -2366,6 +2836,7 @@ def main() -> None:
             expected_cross_index=expected_cross_index,
             warm_start_state=warm_start,
             mp_only=use_mp_only,
+            force_no_lift=use_no_lift,
             ssm_d_model_override=mp_only_d_model if use_mp_only else None,
             ssm_layers_override=mp_only_layers if use_mp_only else None,
         )
@@ -2481,6 +2952,26 @@ def _run_all_plots(
         expected_cross_index=expected_cross_index,
         show_plots=show_plots,
     )
+    if getattr(args, "use_storyboard", True):
+        plot_trajectory_storyboard(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            expected_cross_index=expected_cross_index,
+            show_plots=show_plots,
+        )
+    if getattr(args, "use_storyboard_compact", True):
+        plot_trajectory_storyboard_compact(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            expected_cross_index=expected_cross_index,
+            show_plots=show_plots,
+        )
 
     save_json(run_dir / "metrics.json", {mode: strip_rollout(test_metrics[mode]) for mode, _ in specs})
     save_json(run_dir / "val_metrics.json", {mode: strip_rollout(val_metrics[mode]) for mode, _ in specs})
