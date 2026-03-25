@@ -3,7 +3,7 @@
 A planar navigation task that demonstrates the advantage of **contextual
 Performance Boosting** over a disturbance-only baseline.
 
-![Sample rollout](experiments/contextual_pb_gate_ssm/runs/controlled_xy_20260317_150748/rollout_animation_04_idx1.gif)
+![Sample rollout](experiments/contextual_pb_gate_ssm/runs/controlled_xy_20260317_150748/rollout_animation_03_idx0.gif)
 
 ---
 
